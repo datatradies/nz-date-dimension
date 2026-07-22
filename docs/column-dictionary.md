@@ -1,10 +1,18 @@
 # Column dictionary
 
-The **Calendar**, **Fiscal**, **National holidays**, **Regional**, and
-**Metadata** sections below are the static/stable columns, one row per
-column in the emitted CSV, in output order. Dates are ISO `YYYY-MM-DD`.
-Booleans are the literal strings `true` / `false`. Empty string means "no
-value" (currently only possible for `HolidayName` on a non-holiday date).
+The generator supports three outputs — `--country nz` (default), `--country
+au`, and `--country combined` (unions both) — via the same code, columns
+derived dynamically from each dataset's country config
+(`generator/nz_date_dimension/columns.py`, `countries.py`). This dictionary
+covers all three; where a column differs between them, that's called out
+explicitly.
+
+The **Calendar**, **Fiscal**, **National holidays**, **Regional**,
+**Country** (Combined only), and **Metadata** sections below are the
+static/stable columns, one row per column in the emitted CSV, in output
+order. Dates are ISO `YYYY-MM-DD`. Booleans are the literal strings `true`
+/ `false`. Empty string means "no value" (currently only possible for
+`HolidayName` on a non-holiday date).
 
 The **Relative / time-intelligence columns** section is different: those
 columns are dynamic (computed "as of today") and are **not** part of the
@@ -12,10 +20,14 @@ static CSV — see that section for where they actually live.
 
 ## Calendar (core)
 
+Identical for every country and Combined — computed purely from the date
+itself.
+
 | Column | Type | Description |
 |---|---|---|
 | `Date` | date | The calendar date for this row, ISO `YYYY-MM-DD`. |
-| `DateKey` | integer | Numeric surrogate key, `YYYYMMDD` (e.g. `20250723`). |
+| `DateKey` | integer | Numeric surrogate key, `YYYYMMDD` (e.g. `20250723`). In Combined mode, `DateKey` is **not unique** on its own (an NZ row and an AU row share the same `DateKey` on the same calendar date) — the Combined primary key is the composite `(Date, Country)`, not `DateKey`. |
+| `Country` | string | **Combined mode only** — `"NZ"` or `"AU"`. Positioned right after `DateKey`. Absent entirely from single-country NZ/AU output. |
 | `Year` | integer | Calendar year, e.g. `2025`. |
 | `Quarter` | integer | Calendar quarter, `1`–`4`. |
 | `QuarterName` | string | Calendar quarter label, e.g. `Q3`. |
@@ -38,11 +50,21 @@ static CSV — see that section for where they actually live.
 | `StartOfYear` | date | 1 January of this date's calendar year. |
 | `EndOfYear` | date | 31 December of this date's calendar year. |
 
-## Fiscal (NZ tax year, 1 Apr – 31 Mar)
+## Fiscal (per-country tax year)
+
+- **NZ**: 1 Apr – 31 Mar (`--fiscal-start-month` default `4`).
+- **AU**: 1 Jul – 30 Jun (`--fiscal-start-month` default `7`).
+- **Combined**: each row's fiscal columns are computed from **that row's
+  own country's** fiscal year, not a single shared calendar — an NZ row on
+  1 Aug 2025 and an AU row on the same date can (and do) show different
+  `FiscalYear`/`FiscalStartOfYear` values.
+
+Both conventions label the fiscal year by the year it **ends** in
+(`FY2026`), not the US/calendar convention.
 
 | Column | Type | Description |
 |---|---|---|
-| `FiscalYear` | integer | NZ fiscal year, labelled by the year it **ends** in (FY2026 = 1 Apr 2025 – 31 Mar 2026). |
+| `FiscalYear` | integer | Fiscal year, labelled by the year it **ends** in (FY2026 = 1 Apr 2025 – 31 Mar 2026 for NZ, or 1 Jul 2025 – 30 Jun 2026 for AU). |
 | `FiscalYearLabel` | string | Fiscal year label, e.g. `FY2026`. |
 | `FiscalQuarter` | integer | Fiscal quarter, `1`–`4` (Q1 starts on `fiscal_start_month`). |
 | `FiscalMonth` | integer | Month number within the fiscal year, `1`–`12` (month 1 = `fiscal_start_month`). |
@@ -52,22 +74,56 @@ static CSV — see that section for where they actually live.
 
 ## National holidays
 
+`IsHoliday`/`HolidayName`/`IsObserved`/`IsBusinessDay` reflect each
+country's **national-only** calendar (the holidays observed everywhere in
+that country) — a region/state-only day (e.g. NZ's Auckland Anniversary,
+AU's WA Labour Day) does **not** flip these; it only shows up in that
+region/state's own `IsHoliday_<CODE>` flag (see Regional, below). In
+Combined mode, these four columns reflect **that row's own country's**
+national calendar.
+
+`IsObserved` detection is country-specific (see the README's [Observed-day
+detection](../README.md#observed-day-detection) section for why):
+
+- **NZ**: `true` if `python-holidays` appended `" (observed)"` to the
+  name (NZ keeps both the original weekend date and the shifted Monday in
+  its calendar, differentiated by that suffix).
+- **AU**: `true` if the date is a holiday under `observed=True` but
+  **not** under `observed=False` — AU's make-up Monday carries no suffix
+  and instead *replaces* the original weekend date entirely, so the NZ
+  suffix check would never fire for it.
+
 | Column | Type | Description |
 |---|---|---|
-| `IsHoliday` | boolean | `true` if this date is a New Zealand national public holiday (including Mondayised observed days). |
+| `IsHoliday` | boolean | `true` if this date is a national public holiday for this row's country (including Mondayised/observed days). |
 | `HolidayName` | string | Holiday name verbatim from `python-holidays` (empty if not a holiday). **Not a stable filter key across years or library versions** — use `IsHoliday` / `IsObserved`, not name matching. |
-| `IsObserved` | boolean | `true` if this date is a Mondayised "observed" day (python-holidays appends `(observed)` to `HolidayName`). |
-| `IsBusinessDay` | boolean | `true` unless this date is a weekend, a national public holiday, or a Mondayised observed day. |
+| `IsObserved` | boolean | `true` if this date is a Mondayised "observed" day — see the country-specific detection above. |
+| `IsBusinessDay` | boolean | `true` unless this date is a weekend or this row's country's national public holiday (region/state-only holidays don't affect this — see their own `IsHoliday_<CODE>` flag). |
 
-## Regional (provincial anniversary flags)
+## Regional (provincial/state holiday flags)
 
-One `IsHoliday_<CODE>` boolean column per NZ subdivision (17 total): `AUK`,
-`BOP`, `CAN`, `CIT`, `GIS`, `HKB`, `MBH`, `MWT`, `NSN`, `NTL`, `OTA`, `STL`,
-`TAS`, `TKI`, `WGN`, `WKO`, `WTC`.
+One `IsHoliday_<CODE>` boolean column per subdivision — `true` if that
+date is a public holiday in that subdivision (its country's national
+holidays **or** that specific region/state's own day).
+
+**Single-country output (NZ or AU) uses bare `IsHoliday_<CODE>` columns.**
+**Combined output country-prefixes every flag** (`IsHoliday_NZ_<CODE>` /
+`IsHoliday_AU_<CODE>`) to avoid a collision: NZ's Taranaki and AU's
+Tasmania both use the code `TAS`, so they can only safely share a table
+once prefixed. A row's non-applicable country's flags are always `false`
+in Combined mode (an NZ row's `IsHoliday_AU_*` columns, and vice versa).
+
+**NZ — 17 subdivisions:** `AUK`, `BOP`, `CAN`, `CIT`, `GIS`, `HKB`, `MBH`,
+`MWT`, `NSN`, `NTL`, `OTA`, `STL`, `TAS`, `TKI`, `WGN`, `WKO`, `WTC`.
+
+**AU — 8 states/territories:** `ACT`, `NSW`, `NT`, `QLD`, `SA`, `TAS`,
+`VIC`, `WA`.
 
 | Column | Type | Description |
 |---|---|---|
-| `IsHoliday_<CODE>` | boolean | `true` if this date is a public holiday in that subdivision — i.e. a national holiday **or** that region's provincial anniversary day. |
+| `IsHoliday_<CODE>` (NZ or AU) | boolean | `true` if this date is a public holiday in that subdivision — a national holiday **or** that region/state's own day. |
+| `IsHoliday_NZ_<CODE>` (Combined only) | boolean | Same, for NZ's 17 regions. `false` on every AU row. |
+| `IsHoliday_AU_<CODE>` (Combined only) | boolean | Same, for AU's 8 states/territories. `false` on every NZ row. |
 
 ## Relative / time-intelligence columns (DYNAMIC — not in the static CSV)
 
@@ -83,12 +139,22 @@ time the query/model runs:
 | T-SQL | Companion `CREATE VIEW` (not the base table) | `GETDATE()` |
 | Snowflake SQL | Companion `CREATE VIEW` (not the base table) | `CURRENT_DATE()` |
 | Databricks SQL | Companion `CREATE VIEW` (not the base table) | `current_date()` |
-| dbt model | The model itself (there is no static dbt seed for these) | `current_date()` |
+| dbt model (NZ, AU only — not Combined) | The model itself (there is no static dbt seed for these) | `current_date()` |
 | Python generator | `nz_date_dimension.relative.relative_columns(d, today, ...)` | an injected `today` parameter (deterministic for tests) |
 
 **Timezone caveat:** "today" resolves in the query engine's/session's
-timezone, not necessarily NZ time — for `IsToday` / `IsCalendarYTD` to
-align to NZ midnight, run the dynamic formats in an NZ-timezone session.
+timezone, not necessarily NZ or AU time — for `IsToday` / `IsCalendarYTD`
+to align to local midnight, run the dynamic formats in a matching-timezone
+session.
+
+**Combined-mode fiscal caveat:** the SQL companion VIEW's live
+`TodayFiscalYear`/`TodayFiscalQuarter` reference point uses a single
+`fiscal_start_month` for the whole view (NZ's, unless overridden via
+`--fiscal-start-month`) — so `FiscalYearOffset`, `IsCurrentFiscalYear`,
+`IsFiscalYTD`, and `FiscalQuarterOffset` in that view are fiscal-calendar-
+correct for NZ rows but not AU rows. Every other relative column
+(`DayOffset`, `IsCurrentMonth`, `IsToday`, ...) is unaffected. See the
+README's [Combined ANZ mode](../README.md#combined-anz-mode) section.
 
 | Column | Type | Description |
 |---|---|---|
@@ -120,4 +186,4 @@ align to NZ midnight, run the dynamic formats in an NZ-timezone session.
 
 | Column | Type | Description |
 |---|---|---|
-| `GeneratedOn` | date | The date this CSV was generated (run date), ISO `YYYY-MM-DD`. Appended as the trailing column by the CSV emitter; not part of `STABLE_COLUMNS`. |
+| `GeneratedOn` | date | The date this CSV was generated (run date), ISO `YYYY-MM-DD`. Appended as the trailing column by the CSV emitter; not part of the stable columns list. |
