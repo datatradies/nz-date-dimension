@@ -126,7 +126,10 @@ def emit_powerquery(rows: list, fiscal_start_month: int = 4) -> str:
         "else #date(Date.Year(Today) - 1, FiscalStartMonth, 1)",
         "TodayFiscalEnd = Date.AddDays(Date.AddYears(TodayFiscalStart, 1), -1)",
         "TodayFiscalYear = Date.Year(TodayFiscalEnd)",
-        "TodayFiscalMonth = Number.Mod(Date.Month(Today) - FiscalStartMonth, 12) + 1",
+        # M's Number.Mod follows the dividend's sign (unlike Python's %), so
+        # a bare Number.Mod(x, 12) goes negative for Jan/Feb/Mar under an
+        # April fiscal start -- wrap in the positive-modulo idiom (I2).
+        "TodayFiscalMonth = Number.Mod(Number.Mod(Date.Month(Today) - FiscalStartMonth, 12) + 12, 12) + 1",
         "TodayFiscalQuarter = Number.IntegerDivide(TodayFiscalMonth - 1, 3) + 1",
         f"Source = {_source_table_m(rows)}",
     ]
