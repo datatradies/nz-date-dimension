@@ -71,7 +71,10 @@ DIALECTS = {
         "add_years": lambda x, n: f"DATEADD(year, {n}, {x})",
         "add_days": lambda x, n: f"DATEADD(day, {n}, {x})",
         "datediff_day": lambda a, b: f"DATEDIFF(day, {a}, {b})",
-        "int_div": lambda a, b: f"(({a}) / {b})",
+        # Snowflake '/' is decimal division (7/3 -> 2.333...), unlike T-SQL
+        # (INT truncates) and Databricks (DIV) -- FLOOR to keep fiscal
+        # quarter/week offsets integer-typed per spec 4.5 (I1).
+        "int_div": lambda a, b: f"FLOOR(({a}) / {b})",
         "pos_mod": lambda a, m: f"MOD(MOD({a}, {m}) + {m}, {m})",
         "bool_wrap": lambda cond: cond,
         "statement_sep": "\n;\n",
@@ -118,8 +121,14 @@ def create_table_sql(table_name: str, dialect: str) -> str:
         sql_type = cfg["types"][column_kind(col)]
         nullability = "NULL" if col == "HolidayName" else "NOT NULL"
         col_defs.append(f"    {q(col)} {sql_type} {nullability}")
-    # Databricks PRIMARY KEY constraints are informational only (not
-    # enforced) — included anyway for documentation/consumer-tooling value.
+    if dialect == "databricks":
+        # PRIMARY KEY is a hard syntax error on Databricks outside Unity
+        # Catalog (and merely informational/unenforced even inside it) --
+        # document the natural key as a comment instead of a real
+        # constraint so the script runs on any Databricks target (M3).
+        note = f"-- Primary key: {q('Date')} (informational only -- requires Unity Catalog)\n"
+        return note + f"CREATE TABLE {q(table_name)} (\n" + ",\n".join(col_defs) + "\n);"
+    # T-SQL/Snowflake PRIMARY KEY constraints are fully supported.
     col_defs.append(f"    CONSTRAINT PK_{table_name} PRIMARY KEY ({q('Date')})")
     return f"CREATE TABLE {q(table_name)} (\n" + ",\n".join(col_defs) + "\n);"
 
@@ -155,6 +164,7 @@ def relative_select_sql(table_name: str, dialect: str, fiscal_start_month: int =
     """
     cfg = DIALECTS[dialect]
     q = cfg["quote"]
+    tq = lambda c: f"t.{q(c)}"  # quoted base-table column reference (C1)
     fsm = fiscal_start_month
     today = cfg["today"]
 
@@ -187,16 +197,18 @@ def relative_select_sql(table_name: str, dialect: str, fiscal_start_month: int =
         ")"
     )
 
-    day_offset = cfg["datediff_day"]("c.TodayDate", "t.Date")
-    week_offset = cfg["int_div"](f"({day_offset}) - t.DayOfWeek + c.TodayIsoWeekday", 7)
-    month_offset = "(t.Year - c.TodayYear) * 12 + (t.Month - c.TodayMonth)"
-    quarter_offset = "(t.Year * 4 + t.Quarter) - (c.TodayYear * 4 + c.TodayQuarter)"
-    year_offset = "t.Year - c.TodayYear"
-    fiscal_year_offset = "t.FiscalYear - c.TodayFiscalYear"
+    t_date = tq("Date")
+    day_offset = cfg["datediff_day"]("c.TodayDate", t_date)
+    week_offset = cfg["int_div"](f"({day_offset}) - {tq('DayOfWeek')} + c.TodayIsoWeekday", 7)
+    month_offset = f"({tq('Year')} - c.TodayYear) * 12 + ({tq('Month')} - c.TodayMonth)"
+    quarter_offset = f"({tq('Year')} * 4 + {tq('Quarter')}) - (c.TodayYear * 4 + c.TodayQuarter)"
+    year_offset = f"{tq('Year')} - c.TodayYear"
+    fiscal_year_offset = f"{tq('FiscalYear')} - c.TodayFiscalYear"
     fiscal_quarter_offset = (
-        "(t.FiscalYear * 4 + t.FiscalQuarter) - (c.TodayFiscalYear * 4 + c.TodayFiscalQuarter)"
+        f"({tq('FiscalYear')} * 4 + {tq('FiscalQuarter')}) - "
+        "(c.TodayFiscalYear * 4 + c.TodayFiscalQuarter)"
     )
-    rolling_month_diff = "(c.TodayYear * 12 + c.TodayMonth) - (t.Year * 12 + t.Month)"
+    rolling_month_diff = f"(c.TodayYear * 12 + c.TodayMonth) - ({tq('Year')} * 12 + {tq('Month')})"
 
     last7 = cfg["add_days"]("c.TodayDate", -6)
     last30 = cfg["add_days"]("c.TodayDate", -29)
@@ -212,22 +224,22 @@ def relative_select_sql(table_name: str, dialect: str, fiscal_start_month: int =
         f"{year_offset} AS {q('YearOffset')}",
         f"{fiscal_year_offset} AS {q('FiscalYearOffset')}",
         f"{fiscal_quarter_offset} AS {q('FiscalQuarterOffset')}",
-        f"{bw('t.Date = c.TodayDate')} AS {q('IsToday')}",
+        f"{bw(f'{t_date} = c.TodayDate')} AS {q('IsToday')}",
         f"{bw(f'({week_offset}) = 0')} AS {q('IsCurrentWeek')}",
         f"{bw(f'({month_offset}) = 0')} AS {q('IsCurrentMonth')}",
         f"{bw(f'({quarter_offset}) = 0')} AS {q('IsCurrentQuarter')}",
         f"{bw(f'({year_offset}) = 0')} AS {q('IsCurrentYear')}",
         f"{bw(f'({fiscal_year_offset}) = 0')} AS {q('IsCurrentFiscalYear')}",
-        f"{bw(f'(({year_offset}) = 0) AND (t.Date <= c.TodayDate)')} AS {q('IsCalendarYTD')}",
-        f"{bw(f'(({fiscal_year_offset}) = 0) AND (t.Date <= c.TodayDate)')} AS {q('IsFiscalYTD')}",
-        f"{bw(f'(({month_offset}) = 0) AND (t.Date <= c.TodayDate)')} AS {q('IsMonthToDate')}",
-        f"{bw(f'(({quarter_offset}) = 0) AND (t.Date <= c.TodayDate)')} AS {q('IsQuarterToDate')}",
-        f"{bw(f't.Date >= {last7} AND t.Date <= c.TodayDate')} AS {q('IsLast7Days')}",
-        f"{bw(f't.Date >= {last30} AND t.Date <= c.TodayDate')} AS {q('IsLast30Days')}",
-        f"{bw(f't.Date >= {last90} AND t.Date <= c.TodayDate')} AS {q('IsLast90Days')}",
+        f"{bw(f'(({year_offset}) = 0) AND ({t_date} <= c.TodayDate)')} AS {q('IsCalendarYTD')}",
+        f"{bw(f'(({fiscal_year_offset}) = 0) AND ({t_date} <= c.TodayDate)')} AS {q('IsFiscalYTD')}",
+        f"{bw(f'(({month_offset}) = 0) AND ({t_date} <= c.TodayDate)')} AS {q('IsMonthToDate')}",
+        f"{bw(f'(({quarter_offset}) = 0) AND ({t_date} <= c.TodayDate)')} AS {q('IsQuarterToDate')}",
+        f"{bw(f'{t_date} >= {last7} AND {t_date} <= c.TodayDate')} AS {q('IsLast7Days')}",
+        f"{bw(f'{t_date} >= {last30} AND {t_date} <= c.TodayDate')} AS {q('IsLast30Days')}",
+        f"{bw(f'{t_date} >= {last90} AND {t_date} <= c.TodayDate')} AS {q('IsLast90Days')}",
         f"{bw(f'({month_offset}) = -1')} AS {q('IsPriorMonth')}",
         f"{bw(f'({year_offset}) = -1')} AS {q('IsPriorYear')}",
-        f"{bw(f'(({rolling_month_diff}) BETWEEN 0 AND 11) AND (t.Date <= c.TodayDate)')} AS {q('IsRolling12Months')}",
+        f"{bw(f'(({rolling_month_diff}) BETWEEN 0 AND 11) AND ({t_date} <= c.TodayDate)')} AS {q('IsRolling12Months')}",
     ]
 
     return (
