@@ -1,4 +1,10 @@
 outputs/*.csv
+!outputs/nz-date-dimension.csv
 __pycache__/
 *.pyc
 .venv/
+
+# internal dev artifacts — not part of the published asset
+BUILD-REPORT.md
+FIX-REPORT.md
+REVIEW-REPORT.md

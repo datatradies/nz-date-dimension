@@ -25,6 +25,14 @@ the rest wrong. This one doesn't cut those corners:
   (actively maintained, MIT licensed) rather than a hand-rolled and
   inevitably-stale holiday table.
 
+## Download
+
+Just want the data? Grab the ready-made **2015–2050** CSV directly — no Python required:
+
+**⬇ [`outputs/nz-date-dimension.csv`](outputs/nz-date-dimension.csv)** — 13,149 rows, one per day.
+
+Or generate a custom date range yourself with the quick start below.
+
 ## Quick start
 
 Works the same on Windows (PowerShell/cmd) and bash/zsh — run from inside
@@ -38,8 +46,8 @@ python -m nz_date_dimension.cli --out ../outputs/nz-date-dimension.csv
 ```
 
 This writes the full 2015–2050 date dimension to
-[`outputs/nz-date-dimension.csv`](outputs/nz-date-dimension.csv) (not
-committed to the repo — regenerate it locally; see `.gitignore`).
+[`outputs/nz-date-dimension.csv`](outputs/nz-date-dimension.csv) — the same
+ready-made file that's committed to this repo (see [Download](#download)).
 
 Prefer running from the repo root instead? Point `PYTHONPATH` at the
 `generator/` package for your shell:
