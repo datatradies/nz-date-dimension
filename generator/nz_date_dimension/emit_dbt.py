@@ -15,10 +15,13 @@ DAYOFWEEKISO) for internal consistency with emit_snowflake.py — noted
 here and in the model's own header comment. Swap the date functions if
 compiling against a different warehouse.
 """
+import csv
+import io
+
 from .holidays_nz import NZ_SUBDIVISIONS
 from .sql_common import relative_select_sql
 
-DBT_UTILS_VERSION_PIN = ">=1.1.0, <2.0.0"  # date_spine's end_date inclusivity confirmed at this pin
+DBT_UTILS_VERSION_PIN = ">=1.1.0, <2.0.0"  # pin for dbt_utils.date_spine
 
 SEED_COLUMNS = (
     ["Date", "IsHoliday", "HolidayName", "IsObserved"]
@@ -32,7 +35,12 @@ def build_dbt_seed_csv(rows: list) -> str:
     columns (Year, FiscalYear, ...): the model derives those itself from
     the spine date, so they're not duplicated into the seed.
     """
-    lines = [",".join(SEED_COLUMNS)]
+    # csv.writer (not a bare ",".join) so any future comma/quote/newline in
+    # a seed value (e.g. a HolidayName) is properly quoted rather than
+    # silently corrupting column alignment (M1).
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(SEED_COLUMNS)
     for row in rows:
         values = []
         for col in SEED_COLUMNS:
@@ -45,8 +53,8 @@ def build_dbt_seed_csv(rows: list) -> str:
                 values.append(v.isoformat())
             else:
                 values.append(str(v))
-        lines.append(",".join(values))
-    return "\n".join(lines) + "\n"
+        writer.writerow(values)
+    return buf.getvalue()
 
 def write_dbt_seed(rows: list, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -80,6 +88,12 @@ def build_dbt_model_sql(start_year: int = 2015, end_year: int = 2050,
     fsm = fiscal_start_month
     start_date_lit = f"cast('{start_year}-01-01' as date)"
     end_date_lit = f"cast('{end_year}-12-31' as date)"
+    # One day PAST the intended end_date, used only as date_spine()'s own
+    # end bound (I3). dbt_utils.date_spine's end_date inclusivity has
+    # varied across versions -- rather than trust the pin, generate a spine
+    # that's guaranteed to reach end_date_lit under EITHER inclusive or
+    # exclusive semantics, then explicitly filter back down below.
+    spine_end_date_lit = f"cast('{end_year + 1}-01-01' as date)"
 
     month_name_case = _case_map("date_part(month, date_day)", _MONTH_NAMES[1:])
     month_short_case = _case_map("date_part(month, date_day)", [m[:3] for m in _MONTH_NAMES[1:]])
@@ -151,7 +165,7 @@ def build_dbt_model_sql(start_year: int = 2015, end_year: int = 2050,
     select * from {{{{ ref('{holiday_seed_ref}') }}}}
 ),
 
-with_holidays as (
+"with_holidays" as (
     select
         fiscal_final.*,
         coalesce(holidays."IsHoliday", false) as "IsHoliday",
@@ -179,11 +193,15 @@ with_holidays as (
 --       version: [{DBT_UTILS_VERSION_PIN!r}]
 --
 -- BOUNDARY NOTE (spec sections 8, 11): dbt_utils.date_spine's end_date
--- inclusivity has varied across versions -- as of the {DBT_UTILS_VERSION_PIN}
--- pin above it is INCLUSIVE of end_date (the last spine row equals
--- end_date). tests/test_emit_dbt.py documents this; if a future dbt_utils
--- version reverts to exclusive semantics, adjust end_date below by one day
--- and re-verify the spine's last row against the intended end date.
+-- inclusivity has varied across versions, so this model does NOT rely on
+-- it. date_spine() below is called with spine_end_date -- one day PAST the
+-- intended end_date -- so the raw spine is guaranteed to reach the
+-- intended end_date whether date_spine is inclusive or exclusive of its
+-- own end_date argument. The spine CTE then explicitly filters to
+-- `where date_day between start_date and end_date`, giving the exact
+-- intended [start_date, end_date] range regardless of that boundary
+-- behaviour. A one-time live check against the pinned dbt_utils version is
+-- still recommended before first production run.
 --
 -- Deliberately Snowflake-flavoured SQL (date_part/dateadd/datediff,
 -- dayofweekiso/weekiso/yearofweekiso) for consistency with
@@ -196,13 +214,22 @@ with_holidays as (
 
 {{% set start_date = "{start_date_lit}" %}}
 {{% set end_date = "{end_date_lit}" %}}
+{{% set spine_end_date = "{spine_end_date_lit}" %}}
 
-with spine as (
+with spine_raw as (
     {{{{ dbt_utils.date_spine(
         datepart="day",
         start_date=start_date,
-        end_date=end_date
+        end_date=spine_end_date
     ) }}}}
+),
+
+-- Explicit range filter (I3): clips the raw spine back down to the exact
+-- intended [start_date, end_date] range regardless of whether date_spine's
+-- end_date argument is inclusive or exclusive -- see BOUNDARY NOTE above.
+spine as (
+    select * from spine_raw
+    where date_day between {{{{ start_date }}}} and {{{{ end_date }}}}
 ),
 
 {calendar_core},
