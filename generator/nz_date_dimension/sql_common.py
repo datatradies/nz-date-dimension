@@ -138,12 +138,20 @@ def insert_statements_sql(rows: list, table_name: str, dialect: str, batch_size:
         statements.append(statement)
     return statements
 
-def relative_view_sql(table_name: str, view_name: str, dialect: str, fiscal_start_month: int = 4) -> str:
-    """CREATE VIEW deriving the relative/time-intelligence columns (spec
-    §4.5) from CURRENT_DATE, layered on top of the materialized base
-    table's own stable columns (Year, Month, Quarter, DayOfWeek,
-    FiscalYear, FiscalQuarter) rather than re-deriving calendar attributes
-    from scratch — the base table already computed those once.
+def relative_select_sql(table_name: str, dialect: str, fiscal_start_month: int = 4) -> str:
+    """The reusable core of the relative-columns query: a `WITH
+    today_attrs AS (...) SELECT ... FROM <table_name> AS t CROSS JOIN
+    today_attrs AS c` fragment (no trailing semicolon, no CREATE VIEW
+    wrapper) deriving the relative/time-intelligence columns (spec §4.5)
+    from CURRENT_DATE, layered on top of the materialized base table's own
+    stable columns (Year, Month, Quarter, DayOfWeek, FiscalYear,
+    FiscalQuarter) rather than re-deriving calendar attributes from
+    scratch — the base table already computed those once.
+
+    `table_name` may be a real table OR a CTE name — emit_dbt.py reuses
+    this verbatim against its own staged CTE so the relative-column
+    formulas can never drift between the raw Snowflake SQL emitter and the
+    dbt model.
     """
     cfg = DIALECTS[dialect]
     q = cfg["quote"]
@@ -223,9 +231,15 @@ def relative_view_sql(table_name: str, view_name: str, dialect: str, fiscal_star
     ]
 
     return (
-        f"CREATE VIEW {q(view_name)} AS\n"
         f"{cte_sql}\n"
         "SELECT\n    " + ",\n    ".join(select_cols) + "\n"
         f"FROM {q(table_name)} AS t\n"
-        "CROSS JOIN today_attrs AS c;"
+        "CROSS JOIN today_attrs AS c"
     )
+
+def relative_view_sql(table_name: str, view_name: str, dialect: str, fiscal_start_month: int = 4) -> str:
+    """CREATE VIEW wrapping relative_select_sql() — see that function for
+    the actual relative-column logic (spec §7, §8).
+    """
+    q = DIALECTS[dialect]["quote"]
+    return f"CREATE VIEW {q(view_name)} AS\n{relative_select_sql(table_name, dialect, fiscal_start_month)};"
