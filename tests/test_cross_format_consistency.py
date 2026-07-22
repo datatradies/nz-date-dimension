@@ -113,13 +113,44 @@ def _decode_csv_value(value: str, kind: str):
 
 def _extract_row_tokens(text: str, date_key: int, first_field_pattern: str, close_char: str,
                          quote_char: str) -> list:
-    pattern = re.compile(
-        rf"{first_field_pattern}, {date_key}, .*?{re.escape(close_char)}", re.DOTALL
-    )
-    m = pattern.search(text)
-    assert m, f"row for DateKey {date_key} not found (pattern: {first_field_pattern})"
-    inner = m.group(0)[1:-1]  # strip outer ( or {
-    return _split_top_level(inner, quote_char)
+    """Locate the row starting at `first_field_pattern, {date_key}, ` and
+    scan forward tracking quote state to find the row's own top-level
+    close_char (M2 regression guard).
+
+    The previous implementation used a non-greedy regex (`.*?` + close_char)
+    that stopped at the FIRST close_char in the text -- including one
+    embedded inside a quoted value, e.g. a Mondayised HolidayName like
+    "Anzac Day (observed)" contains a literal ')' that would truncate a
+    T-SQL row early and misalign every subsequent column index. Tracking
+    quote state (with doubled-quote escaping, matching _split_top_level's
+    convention) ensures only a close_char OUTSIDE any quoted literal ends
+    the row.
+    """
+    start_pattern = re.compile(rf"{first_field_pattern}, {date_key}, ")
+    start_m = start_pattern.search(text)
+    assert start_m, f"row for DateKey {date_key} not found (pattern: {first_field_pattern})"
+    row_start = start_m.start()
+    i = start_m.end()
+    in_quotes = False
+    while i < len(text):
+        ch = text[i]
+        if in_quotes:
+            if ch == quote_char and i + 1 < len(text) and text[i + 1] == quote_char:
+                i += 2
+                continue
+            if ch == quote_char:
+                in_quotes = False
+            i += 1
+            continue
+        if ch == quote_char:
+            in_quotes = True
+            i += 1
+            continue
+        if ch == close_char:
+            inner = text[row_start + 1:i]  # strip outer ( or {
+            return _split_top_level(inner, quote_char)
+        i += 1
+    raise AssertionError(f"unterminated row for DateKey {date_key} (no top-level {close_char!r})")
 
 def test_stable_columns_agree_across_csv_sql_and_powerquery(tmp_path):
     rows = build_dataset(2025, 2025)  # 365 rows
@@ -154,3 +185,30 @@ def test_stable_columns_agree_across_csv_sql_and_powerquery(tmp_path):
             assert csv_val == expected, f"{d} {col}: CSV={csv_val!r} != source={expected!r}"
             assert sql_val == expected, f"{d} {col}: T-SQL={sql_val!r} != source={expected!r}"
             assert m_val == expected, f"{d} {col}: M={m_val!r} != source={expected!r}"
+
+def test_extract_row_tokens_handles_holiday_name_containing_close_paren():
+    """Regression for review finding M2: an observed/Mondayised holiday's
+    HolidayName contains a literal ')' (e.g. "Anzac Day (observed)"). The
+    old non-greedy regex `.*?)` in _extract_row_tokens stopped at the FIRST
+    ')' -- which lands inside the quoted HolidayName rather than at the
+    row's real terminator -- truncating the row and misaligning every
+    column index after it. None of SAMPLE_DATES above hit this case (an
+    accidental invariant, not a guarantee), so this test picks a real
+    observed holiday directly from build_dataset() to exercise it.
+    """
+    rows = build_dataset(2015, 2030)
+    observed_row = next(r for r in rows if r["IsObserved"])
+    assert "(observed)" in observed_row["HolidayName"]
+    year = observed_row["Date"].year
+
+    sql_rows = build_dataset(year, year)
+    sql_text = emit_tsql(sql_rows, fiscal_start_month=4)
+    tokens = _extract_row_tokens(
+        sql_text, observed_row["DateKey"], r"\('\d{4}-\d{2}-\d{2}'", ")", "'"
+    )
+    assert len(tokens) == len(STABLE_COLUMNS), (
+        f"row truncated: got {len(tokens)} tokens, expected {len(STABLE_COLUMNS)}"
+    )
+    holiday_name_idx = STABLE_COLUMNS.index("HolidayName")
+    decoded = _decode_sql_token(tokens[holiday_name_idx], "str", "tsql")
+    assert decoded == observed_row["HolidayName"]
